@@ -1,0 +1,27 @@
+{
+    "name": "solana-tx-confirm",
+    "version": "0.1.0",
+    "description": "Confirm Solana transactions by signature polling - returns confirmed, failed, expired, or unknown.",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "files": ["dist"],
+    "license": "MIT",
+    "author": "Cao Nguyen Duy <cnduy07@gmail.com>",
+    "repository": { "type": "git", "url": "git+https://github.com/cnduy07/solana-tx-confirm.git" },
+    "keywords": ["solana", "transaction", "confirmation"],
+    "scripts": {
+        "build": "tsc -p tsconfig.build.json",
+        "typecheck": "tsc --noEmit",
+        "test": "mocha"
+    },
+    "devDependencies": {
+        "typescript": "^7.0.2",
+        "mocha": "^12.0.2",
+        "sinon": "^22.1.0",
+        "@types/node": "^26.6.3",
+        "@types/mocha": "^10.0.10",
+        "@types/sinon": "^22.0.0",
+        "@solana/web3.js": "^1.99.0"
+    },
+    "peerDependencies": { "@solana/web3.js": "^1.99.0" }
+}
