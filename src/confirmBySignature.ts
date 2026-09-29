@@ -54,11 +54,28 @@ function numberField(source: Record<string, unknown>, key: string): number | und
     return typeof value === 'number' ? value : undefined;
 }
 
+function objectField(source: Record<string, unknown>, key: string): Record<string, unknown> {
+    const value = source[key];
+    return (typeof value === 'object' && value !== null) ? value as Record<string, unknown> : {};
+}
+
+// @solana/web3.js v1 rejects HTTP failures with a bare Error carrying no fields
+// at all - the status only survives at the front of the message, as in
+// "401 Unauthorized: {...}".
+function httpStatusFromMessage(message: string): number | undefined {
+    const match = /^(\d{3})\s/.exec(message);
+    return match ? Number(match[1]) : undefined;
+}
+
 export function classifyRpcError(err: unknown): RpcErrorKind {
     const source = (typeof err === 'object' && err !== null) ? err as Record<string, unknown> : {};
-    const code = numberField(source, 'code');
-    const httpStatus = numberField(source, 'status') ?? numberField(source, 'statusCode');
     const message = typeof source.message === 'string' ? source.message : String(err ?? '');
+    // `code` sits at the top level on v1's SolanaJSONRPCError and under `context`
+    // on the v2 / @solana/kit SolanaError.
+    const code = numberField(source, 'code') ?? numberField(objectField(source, 'context'), 'code');
+    const httpStatus = numberField(source, 'status')
+        ?? numberField(source, 'statusCode')
+        ?? httpStatusFromMessage(message);
 
     if (httpStatus === 429 || code === 429 || /429|too many requests|rate.?limit/i.test(message)) {
         return 'rate-limited';
