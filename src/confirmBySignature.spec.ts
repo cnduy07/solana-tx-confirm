@@ -73,8 +73,6 @@ describe('analyseSignatureStatus', () => {
 });
 
 describe('classifyRpcError', () => {
-    // The shapes below were captured from a real Connection hitting a local
-    // server, so they are what @solana/web3.js v1 actually rejects with.
 
     describe('rate-limited', () => {
         it('reads a 429 from the front of a bare Error message (web3.js v1 shape)', () => {
@@ -117,8 +115,6 @@ describe('classifyRpcError', () => {
     });
 
     describe('transient', () => {
-        // This is the test that fails if anyone ever rewrites the classifier as
-        // "has an HTTP status -> permanent". The status value decides, not its presence.
         it('treats HTTP 500 as transient, not permanent', () => {
             assert.strictEqual(classifyRpcError(new Error('500 Internal Server Error: oops')), 'transient');
         });
@@ -151,7 +147,6 @@ describe('confirmBySignature', () => {
     const LAST_VALID_BLOCK_HEIGHT = 1000;
     const EXPIRED_HEIGHT = LAST_VALID_BLOCK_HEIGHT + 1;
 
-    // Poll intervals small enough that the real timer never dominates a test.
     const FAST = { fastPollMs: 1, slowPollMs: 1 };
 
     const status = (over: Partial<SignatureStatus>): SignatureStatus =>
@@ -159,10 +154,6 @@ describe('confirmBySignature', () => {
 
     type Step = SignatureStatus | null | Error;
 
-    /**
-     * Builds a fresh fake per test - a factory rather than a shared object, so no
-     * test can inherit another test's call counter.
-     */
     function makeFake(script: { hot: Step[]; history?: Step; blockHeight?: number }) {
         let hotIndex = 0;
         const configs: Array<SignatureStatusConfig | undefined> = [];
@@ -216,10 +207,6 @@ describe('confirmBySignature', () => {
             { status: 'expired' });
     });
 
-    // The bug this library exists for: after a restart the signature has dropped
-    // out of the RPC's recent cache, so the cheap poll returns null forever while
-    // the block height is long past. Without the ledger search this reports a
-    // successful buy as expired.
     it('returns confirmed when the signature fell out of the recent cache but is in the ledger', async () => {
         const { connection } = makeFake({
             hot: [null],
@@ -231,8 +218,6 @@ describe('confirmBySignature', () => {
             { status: 'confirmed' });
     });
 
-    // A transaction that is only 'processed' is already inside a block, so the
-    // expired blockhash cannot undo it. Reporting expired here would be a lie.
     it('keeps waiting when the ledger search finds the transaction still processed', async () => {
         const { connection } = makeFake({
             hot: [null, status({ confirmationStatus: 'confirmed' })],
@@ -246,9 +231,6 @@ describe('confirmBySignature', () => {
 
     it('throws straight away on a permanent RPC error instead of polling for the full timeout', async () => {
         const { connection } = makeFake({ hot: [Object.assign(new Error('WrongSize'), { code: -32013 })] });
-        // The short timeout is deliberate: if the throw is ever removed, this
-        // resolves within milliseconds and assert.rejects reports a clear failure
-        // rather than letting the suite hang for the full default timeout.
         await assert.rejects(
             () => confirmBySignature(connection, SIG, LAST_VALID_BLOCK_HEIGHT, { ...FAST, timeoutMs: 30 }),
             (err: unknown) => (err as { code?: number }).code === -32013);
@@ -270,8 +252,6 @@ describe('confirmBySignature', () => {
 
         const searched = configs.filter(c => c?.searchTransactionHistory === true);
         assert.strictEqual(searched.length, 1, 'the ledger must be searched exactly once');
-        // Three cheap polls come first; the expensive one is last, after the
-        // height check fired on the third tick.
         assert.strictEqual(configs.length, 4);
         assert.deepStrictEqual(configs.slice(0, 3), [undefined, undefined, undefined]);
     });
@@ -315,7 +295,6 @@ describe('confirmBySignature', () => {
             await clock.tickAsync(10_000);
 
             assert.deepStrictEqual(await pending, { status: 'confirmed' });
-            // 400 + 1000, then 400 + 2000.
             assert.deepStrictEqual(callTimes, [0, 1400, 3800]);
         });
 

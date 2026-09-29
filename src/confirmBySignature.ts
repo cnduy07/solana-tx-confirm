@@ -40,11 +40,11 @@ export type ConfirmResult =
 export type RpcErrorKind = 'rate-limited' | 'permanent' | 'transient';
 
 const PERMANENT_JSON_RPC_CODES = new Set([
-    -32700, // parse error
-    -32600, // invalid request
-    -32601, // method not found
-    -32602, // invalid params
-    -32013, // transaction signature length mismatch
+    -32700,
+    -32600,
+    -32601,
+    -32602,
+    -32013,
 ]);
 
 const PERMANENT_HTTP_CODES = new Set([400, 401, 403, 404]);
@@ -59,9 +59,6 @@ function objectField(source: Record<string, unknown>, key: string): Record<strin
     return (typeof value === 'object' && value !== null) ? value as Record<string, unknown> : {};
 }
 
-// @solana/web3.js v1 rejects HTTP failures with a bare Error carrying no fields
-// at all - the status only survives at the front of the message, as in
-// "401 Unauthorized: {...}".
 function httpStatusFromMessage(message: string): number | undefined {
     const match = /^(\d{3})\s/.exec(message);
     return match ? Number(match[1]) : undefined;
@@ -70,8 +67,6 @@ function httpStatusFromMessage(message: string): number | undefined {
 export function classifyRpcError(err: unknown): RpcErrorKind {
     const source = (typeof err === 'object' && err !== null) ? err as Record<string, unknown> : {};
     const message = typeof source.message === 'string' ? source.message : String(err ?? '');
-    // `code` sits at the top level on v1's SolanaJSONRPCError and under `context`
-    // on the v2 / @solana/kit SolanaError.
     const code = numberField(source, 'code') ?? numberField(objectField(source, 'context'), 'code');
     const httpStatus = numberField(source, 'status')
         ?? numberField(source, 'statusCode')
