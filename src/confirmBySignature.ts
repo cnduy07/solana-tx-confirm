@@ -12,6 +12,25 @@ export interface SignatureConfirmer {
     getBlockHeight(commitmentOrConfig?: Commitment | GetBlockHeightConfig): Promise<number>;
 }
 
+export interface ConfirmOptions {
+    timeoutMs?: number;
+    fastPollMs?: number;
+    slowPollMs?: number;
+    fastPollCount?: number;
+    heightCheckEvery?: number;
+}
+
+export const DEFAULT_CONFIRM_OPTIONS = {
+    timeoutMs: 120_000,
+    fastPollMs: 400,
+    slowPollMs: 1500,
+    fastPollCount: 5,
+    heightCheckEvery: 5,
+} as const;
+
+const FIRST_RATE_LIMIT_BACKOFF_MS = 1000;
+const MAX_RATE_LIMIT_BACKOFF_MS = 8000;
+
 export type ConfirmResult =
     | { status: 'confirmed' }
     | { status: 'failed'; err: unknown }
@@ -71,9 +90,13 @@ export function analyseSignatureStatus(s: SignatureStatus | null): ConfirmResult
     return 'pending';
 }
 
-
-export async function confirmBySignature(connection: SignatureConfirmer, signature: string, lastValidBlockHeight: number): Promise<ConfirmResult> {
-    const deadline = Date.now() + 120000;
+export async function confirmBySignature(connection: SignatureConfirmer, signature: string, lastValidBlockHeight: number, options: ConfirmOptions = {}): Promise<ConfirmResult> {
+    const timeoutMs = options.timeoutMs ?? DEFAULT_CONFIRM_OPTIONS.timeoutMs;
+    const fastPollMs = options.fastPollMs ?? DEFAULT_CONFIRM_OPTIONS.fastPollMs;
+    const slowPollMs = options.slowPollMs ?? DEFAULT_CONFIRM_OPTIONS.slowPollMs;
+    const fastPollCount = options.fastPollCount ?? DEFAULT_CONFIRM_OPTIONS.fastPollCount;
+    const heightCheckEvery = Math.max(1, options.heightCheckEvery ?? DEFAULT_CONFIRM_OPTIONS.heightCheckEvery);
+    const deadline = Date.now() + timeoutMs;
     let tick = 0;
     let lastError: unknown;
     let rateLimitBackoffMs = 0;
@@ -89,7 +112,7 @@ export async function confirmBySignature(connection: SignatureConfirmer, signatu
                 return output;
             }
 
-            if (++tick % 5 === 0) {
+            if (++tick % heightCheckEvery === 0) {
                 const currentBlockHeight = await connection.getBlockHeight("confirmed");
                 if (currentBlockHeight > lastValidBlockHeight) {
                     const currentStatus = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
@@ -103,19 +126,19 @@ export async function confirmBySignature(connection: SignatureConfirmer, signatu
                 }
             }
         } catch (err) {
-            // An RPC failure says nothing about the transaction, so it can never
-            // produce 'failed' or 'expired' - only a retry, or 'unknown' at the end.
             const kind = classifyRpcError(err);
             if (kind === 'permanent') {
                 throw err;
             }
             lastError = err;
             if (kind === 'rate-limited') {
-                rateLimitBackoffMs = rateLimitBackoffMs === 0 ? 1000 : Math.min(rateLimitBackoffMs * 2, 8000);
+                rateLimitBackoffMs = rateLimitBackoffMs === 0
+                    ? FIRST_RATE_LIMIT_BACKOFF_MS
+                    : Math.min(rateLimitBackoffMs * 2, MAX_RATE_LIMIT_BACKOFF_MS);
             }
         }
 
-        await new Promise(r => setTimeout(r, (tick < 6 ? 400 : 1500) + rateLimitBackoffMs));
+        await new Promise(r => setTimeout(r, (tick <= fastPollCount ? fastPollMs : slowPollMs) + rateLimitBackoffMs));
     }
 
     return { status: 'unknown', err: lastError };
