@@ -1,4 +1,4 @@
-import {
+import type {
     GetBlockHeightConfig,
     Commitment,
     TransactionSignature,
@@ -15,8 +15,23 @@ export interface SignatureConfirmer {
 export type ConfirmResult =
     | { status: 'confirmed' }
     | { status: 'failed'; err: unknown }
-    | { status: 'expired'}
+    | { status: 'expired' }
     | { status: 'unknown' }
+
+export function analyseSignatureStatus(s: SignatureStatus | null): ConfirmResult | 'pending' | 'not-found' {
+    if (s) {
+        if (s.err) {
+            return { status: 'failed', err: s.err};
+        }
+
+        if (s.confirmationStatus === 'confirmed' || s.confirmationStatus === 'finalized') {
+            return { status: 'confirmed' };
+        }
+    } else {
+        return 'not-found';
+    }
+    return 'pending';
+}
 
 
 export async function confirmBySignature(connection: SignatureConfirmer, signature: string, lastValidBlockHeight: number): Promise<ConfirmResult> {
@@ -24,22 +39,25 @@ export async function confirmBySignature(connection: SignatureConfirmer, signatu
     let tick = 0;
     while (Date.now() < deadline) {
         try {
+            let output: ConfirmResult | 'not-found' | 'pending';
             const signatureStatus = await connection.getSignatureStatuses([signature]);
             const s = signatureStatus.value[0];
-
-            if (s) {
-                if (s.err) {
-                    return { status: 'failed', err: s.err};
-                }
-                if (s.confirmationStatus === 'confirmed' || s.confirmationStatus === 'finalized') {
-                    return { status: 'confirmed'};
-                }
+            output = analyseSignatureStatus(s);
+            if (output !== 'not-found' && output !== 'pending') {
+                return output;
             }
 
             if (++tick % 5 === 0) {
                 const currentBlockHeight = await connection.getBlockHeight("confirmed");
                 if (currentBlockHeight > lastValidBlockHeight) {
-                    return { status: 'expired'}
+                    const currentStatus = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+                    const s2 = currentStatus.value[0];
+                    output = analyseSignatureStatus(s2);
+                    if (output === 'not-found') {
+                        return { status: 'expired' };
+                    } else if (output !== 'pending') {
+                        return output;
+                    }
                 }
             }
         } catch (err) {
