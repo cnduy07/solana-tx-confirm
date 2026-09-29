@@ -1,3 +1,4 @@
 {
-    "spec": "src/**/*.spec.ts"
+    "spec": "src/**/*.spec.ts",
+    "node-option": ["disable-warning=MODULE_TYPELESS_PACKAGE_JSON"]
 }
