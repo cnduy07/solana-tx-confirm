@@ -3,3 +3,5 @@ dist/
 .env
 .DS_Store
 coverage/
+report.vi.md
+report.en.md
