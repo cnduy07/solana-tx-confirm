@@ -49,6 +49,14 @@ const PERMANENT_JSON_RPC_CODES = new Set([
 
 const PERMANENT_HTTP_CODES = new Set([400, 401, 403, 404]);
 
+const RATE_LIMIT_WORDING = /429|too many requests|rate.?limit/i;
+
+const HTTP_STATUS_AT_START_OF_MESSAGE = /^(\d{3})\s/;
+
+function sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function numberField(source: Record<string, unknown>, key: string): number | undefined {
     const value = source[key];
     return typeof value === 'number' ? value : undefined;
@@ -60,27 +68,35 @@ function objectField(source: Record<string, unknown>, key: string): Record<strin
 }
 
 function httpStatusFromMessage(message: string): number | undefined {
-    const match = /^(\d{3})\s/.exec(message);
-    return match ? Number(match[1]) : undefined;
+    const match = HTTP_STATUS_AT_START_OF_MESSAGE.exec(message);
+    if (match === null) {
+        return undefined;
+    }
+    return Number(match[1]);
 }
 
 export function classifyRpcError(err: unknown): RpcErrorKind {
-    const source = (typeof err === 'object' && err !== null) ? err as Record<string, unknown> : {};
-    const message = typeof source.message === 'string' ? source.message : String(err ?? '');
-    const code = numberField(source, 'code') ?? numberField(objectField(source, 'context'), 'code');
-    const httpStatus = numberField(source, 'status')
-        ?? numberField(source, 'statusCode')
-        ?? httpStatusFromMessage(message);
+    const isObject = typeof err === 'object' && err !== null;
+    const source = isObject ? err as Record<string, unknown> : {};
 
-    if (httpStatus === 429 || code === 429 || /429|too many requests|rate.?limit/i.test(message)) {
+    const message = typeof source.message === 'string' ? source.message : String(err ?? '');
+
+    const topLevelCode = numberField(source, 'code');
+    const kitContextCode = numberField(objectField(source, 'context'), 'code');
+    const jsonRpcCode = topLevelCode ?? kitContextCode;
+
+    const statusField = numberField(source, 'status') ?? numberField(source, 'statusCode');
+    const httpStatus = statusField ?? httpStatusFromMessage(message);
+
+    const saysRateLimited = RATE_LIMIT_WORDING.test(message);
+    const isRateLimited = httpStatus === 429 || jsonRpcCode === 429 || saysRateLimited;
+    if (isRateLimited) {
         return 'rate-limited';
     }
 
-    if (code !== undefined && PERMANENT_JSON_RPC_CODES.has(code)) {
-        return 'permanent';
-    }
-
-    if (httpStatus !== undefined && PERMANENT_HTTP_CODES.has(httpStatus)) {
+    const isPermanentJsonRpcCode = jsonRpcCode !== undefined && PERMANENT_JSON_RPC_CODES.has(jsonRpcCode);
+    const isPermanentHttpStatus = httpStatus !== undefined && PERMANENT_HTTP_CODES.has(httpStatus);
+    if (isPermanentJsonRpcCode || isPermanentHttpStatus) {
         return 'permanent';
     }
 
@@ -107,7 +123,9 @@ export async function confirmBySignature(connection: SignatureConfirmer, signatu
     const fastPollMs = options.fastPollMs ?? DEFAULT_CONFIRM_OPTIONS.fastPollMs;
     const slowPollMs = options.slowPollMs ?? DEFAULT_CONFIRM_OPTIONS.slowPollMs;
     const fastPollCount = options.fastPollCount ?? DEFAULT_CONFIRM_OPTIONS.fastPollCount;
-    const heightCheckEvery = Math.max(1, options.heightCheckEvery ?? DEFAULT_CONFIRM_OPTIONS.heightCheckEvery);
+    const requestedHeightCheckEvery = options.heightCheckEvery ?? DEFAULT_CONFIRM_OPTIONS.heightCheckEvery;
+    const heightCheckEvery = Math.max(1, requestedHeightCheckEvery);
+
     const deadline = Date.now() + timeoutMs;
     let tick = 0;
     let lastError: unknown;
@@ -115,42 +133,56 @@ export async function confirmBySignature(connection: SignatureConfirmer, signatu
 
     while (Date.now() < deadline) {
         try {
-            let output: ConfirmResult | 'not-found' | 'pending';
-            const signatureStatus = await connection.getSignatureStatuses([signature]);
+            const cheapPoll = await connection.getSignatureStatuses([signature]);
             rateLimitBackoffMs = 0;
-            const s = signatureStatus.value[0];
-            output = analyseSignatureStatus(s);
-            if (output !== 'not-found' && output !== 'pending') {
-                return output;
+
+            const cheapOutcome = analyseSignatureStatus(cheapPoll.value[0]);
+            const cheapPollDecided = cheapOutcome !== 'not-found' && cheapOutcome !== 'pending';
+            if (cheapPollDecided) {
+                return cheapOutcome;
             }
 
-            if (++tick % heightCheckEvery === 0) {
+            tick = tick + 1;
+            const timeToCheckBlockHeight = tick % heightCheckEvery === 0;
+
+            if (timeToCheckBlockHeight) {
                 const currentBlockHeight = await connection.getBlockHeight("confirmed");
-                if (currentBlockHeight > lastValidBlockHeight) {
-                    const currentStatus = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
-                    const s2 = currentStatus.value[0];
-                    output = analyseSignatureStatus(s2);
-                    if (output === 'not-found') {
+                const blockhashExpired = currentBlockHeight > lastValidBlockHeight;
+
+                if (blockhashExpired) {
+                    const ledgerSearch = await connection.getSignatureStatuses(
+                        [signature], { searchTransactionHistory: true });
+                    const ledgerOutcome = analyseSignatureStatus(ledgerSearch.value[0]);
+
+                    if (ledgerOutcome === 'not-found') {
                         return { status: 'expired' };
-                    } else if (output !== 'pending') {
-                        return output;
+                    }
+                    if (ledgerOutcome !== 'pending') {
+                        return ledgerOutcome;
                     }
                 }
             }
         } catch (err) {
             const kind = classifyRpcError(err);
+
             if (kind === 'permanent') {
                 throw err;
             }
+
             lastError = err;
+
             if (kind === 'rate-limited') {
-                rateLimitBackoffMs = rateLimitBackoffMs === 0
+                const isFirstRateLimit = rateLimitBackoffMs === 0;
+                const doubled = rateLimitBackoffMs * 2;
+                rateLimitBackoffMs = isFirstRateLimit
                     ? FIRST_RATE_LIMIT_BACKOFF_MS
-                    : Math.min(rateLimitBackoffMs * 2, MAX_RATE_LIMIT_BACKOFF_MS);
+                    : Math.min(doubled, MAX_RATE_LIMIT_BACKOFF_MS);
             }
         }
 
-        await new Promise(r => setTimeout(r, (tick <= fastPollCount ? fastPollMs : slowPollMs) + rateLimitBackoffMs));
+        const stillPollingFast = tick <= fastPollCount;
+        const pollInterval = stillPollingFast ? fastPollMs : slowPollMs;
+        await sleep(pollInterval + rateLimitBackoffMs);
     }
 
     return { status: 'unknown', err: lastError };

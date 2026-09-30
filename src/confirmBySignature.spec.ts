@@ -73,66 +73,83 @@ describe('analyseSignatureStatus', () => {
 });
 
 describe('classifyRpcError', () => {
+    function errorWithFields(message: string, fields: Record<string, unknown>): Error {
+        return Object.assign(new Error(message), fields);
+    }
 
     describe('rate-limited', () => {
         it('reads a 429 from the front of a bare Error message (web3.js v1 shape)', () => {
-            assert.strictEqual(classifyRpcError(new Error('429 Too Many Requests: {}')), 'rate-limited');
+            const error = new Error('429 Too Many Requests: {}');
+            assert.strictEqual(classifyRpcError(error), 'rate-limited');
         });
 
         it('reads a 429 from a status field (other HTTP clients)', () => {
-            assert.strictEqual(classifyRpcError(Object.assign(new Error('x'), { status: 429 })), 'rate-limited');
+            const error = errorWithFields('rejected', { status: 429 });
+            assert.strictEqual(classifyRpcError(error), 'rate-limited');
         });
 
         it('reads a 429 from a numeric code field', () => {
-            assert.strictEqual(classifyRpcError(Object.assign(new Error('x'), { code: 429 })), 'rate-limited');
+            const error = errorWithFields('rejected', { code: 429 });
+            assert.strictEqual(classifyRpcError(error), 'rate-limited');
         });
 
         it('recognises "rate limit" wording without any status', () => {
-            assert.strictEqual(classifyRpcError(new Error('Your app has exceeded its rate limit')), 'rate-limited');
+            const error = new Error('Your app has exceeded its rate limit');
+            assert.strictEqual(classifyRpcError(error), 'rate-limited');
         });
     });
 
     describe('permanent', () => {
         it('treats HTTP 401 in the message as permanent (a wrong API key never fixes itself)', () => {
-            assert.strictEqual(classifyRpcError(new Error('401 Unauthorized: {"error":"bad api key"}')), 'permanent');
+            const error = new Error('401 Unauthorized: {"error":"bad api key"}');
+            assert.strictEqual(classifyRpcError(error), 'permanent');
         });
 
         it('treats HTTP 403 in the message as permanent', () => {
-            assert.strictEqual(classifyRpcError(new Error('403 Forbidden: {}')), 'permanent');
+            const error = new Error('403 Forbidden: {}');
+            assert.strictEqual(classifyRpcError(error), 'permanent');
         });
 
         it('treats a malformed signature (-32013) as permanent', () => {
-            assert.strictEqual(classifyRpcError(Object.assign(new Error('WrongSize'), { code: -32013 })), 'permanent');
+            const error = errorWithFields('WrongSize', { code: -32013 });
+            assert.strictEqual(classifyRpcError(error), 'permanent');
         });
 
         it('treats invalid params (-32602) as permanent', () => {
-            assert.strictEqual(classifyRpcError(Object.assign(new Error('Invalid param'), { code: -32602 })), 'permanent');
+            const error = errorWithFields('Invalid param', { code: -32602 });
+            assert.strictEqual(classifyRpcError(error), 'permanent');
         });
 
         it('reads the code from context.code as well (@solana/kit shape)', () => {
-            assert.strictEqual(classifyRpcError({ message: 'x', context: { code: -32602 } }), 'permanent');
+            const kitStyleError = { message: 'rejected', context: { code: -32602 } };
+            assert.strictEqual(classifyRpcError(kitStyleError), 'permanent');
         });
     });
 
     describe('transient', () => {
         it('treats HTTP 500 as transient, not permanent', () => {
-            assert.strictEqual(classifyRpcError(new Error('500 Internal Server Error: oops')), 'transient');
+            const error = new Error('500 Internal Server Error: oops');
+            assert.strictEqual(classifyRpcError(error), 'transient');
         });
 
         it('treats a node that is behind (-32005) as transient', () => {
-            assert.strictEqual(classifyRpcError(Object.assign(new Error('Node is behind'), { code: -32005 })), 'transient');
+            const error = errorWithFields('Node is behind', { code: -32005 });
+            assert.strictEqual(classifyRpcError(error), 'transient');
         });
 
         it('treats missing ledger history (-32011) as transient, so cheap RPCs still get an answer', () => {
-            assert.strictEqual(classifyRpcError(Object.assign(new Error('history not available'), { code: -32011 })), 'transient');
+            const error = errorWithFields('history not available', { code: -32011 });
+            assert.strictEqual(classifyRpcError(error), 'transient');
         });
 
         it('ignores a string code such as ECONNRESET instead of reading it as a JSON-RPC code', () => {
-            assert.strictEqual(classifyRpcError(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })), 'transient');
+            const error = errorWithFields('socket hang up', { code: 'ECONNRESET' });
+            assert.strictEqual(classifyRpcError(error), 'transient');
         });
 
         it('handles a network failure', () => {
-            assert.strictEqual(classifyRpcError(new TypeError('fetch failed')), 'transient');
+            const error = new TypeError('fetch failed');
+            assert.strictEqual(classifyRpcError(error), 'transient');
         });
 
         it('survives a thrown value that is not an Error', () => {
@@ -143,172 +160,280 @@ describe('classifyRpcError', () => {
 });
 
 describe('confirmBySignature', () => {
-    const SIG = 'sig';
+    const SIGNATURE = 'a-signature';
     const LAST_VALID_BLOCK_HEIGHT = 1000;
-    const EXPIRED_HEIGHT = LAST_VALID_BLOCK_HEIGHT + 1;
+    const HEIGHT_PAST_EXPIRY = LAST_VALID_BLOCK_HEIGHT + 1;
+    const HEIGHT_STILL_VALID = LAST_VALID_BLOCK_HEIGHT - 1;
 
-    const FAST = { fastPollMs: 1, slowPollMs: 1 };
+    const FAST_POLLING = { fastPollMs: 1, slowPollMs: 1 };
+    const CHECK_HEIGHT_EVERY_TICK = { ...FAST_POLLING, heightCheckEvery: 1 };
+    const GIVE_UP_QUICKLY = { ...FAST_POLLING, timeoutMs: 20 };
 
-    const status = (over: Partial<SignatureStatus>): SignatureStatus =>
-        ({ slot: 1, confirmations: 1, err: null, ...over } as SignatureStatus);
+    function makeStatus(overrides: Partial<SignatureStatus>): SignatureStatus {
+        const required = { slot: 1, confirmations: 1, err: null };
+        return { ...required, ...overrides } as SignatureStatus;
+    }
 
-    type Step = SignatureStatus | null | Error;
+    const CONFIRMED = makeStatus({ confirmationStatus: 'confirmed' });
+    const FINALIZED = makeStatus({ confirmationStatus: 'finalized' });
+    const PROCESSED = makeStatus({ confirmationStatus: 'processed' });
+    const NOT_FOUND = null;
 
-    function makeFake(script: { hot: Step[]; history?: Step; blockHeight?: number }) {
-        let hotIndex = 0;
-        const configs: Array<SignatureStatusConfig | undefined> = [];
+    type ScriptedResponse = SignatureStatus | null | Error;
 
-        const unwrap = (step: Step) => {
-            if (step instanceof Error) throw step;
-            return { context: { slot: 1 }, value: [step ?? null] };
-        };
+    interface Script {
+        hotPolls: ScriptedResponse[];
+        ledgerSearch?: ScriptedResponse;
+        blockHeight?: number;
+    }
+
+    function makeFakeConnection(script: Script) {
+        let hotPollCount = 0;
+        const receivedConfigs: Array<SignatureStatusConfig | undefined> = [];
+
+        function nextHotPollResponse(): ScriptedResponse {
+            const lastIndex = script.hotPolls.length - 1;
+            const index = hotPollCount < lastIndex ? hotPollCount : lastIndex;
+            hotPollCount = hotPollCount + 1;
+            return script.hotPolls[index] ?? NOT_FOUND;
+        }
+
+        function asRpcResponse(response: ScriptedResponse) {
+            if (response instanceof Error) {
+                throw response;
+            }
+            return { context: { slot: 1 }, value: [response] };
+        }
+
+        function isLedgerSearch(config: SignatureStatusConfig | undefined): boolean {
+            return config?.searchTransactionHistory === true;
+        }
 
         const connection: SignatureConfirmer = {
             async getSignatureStatuses(_signatures: string[], config?: SignatureStatusConfig) {
-                configs.push(config);
-                if (config?.searchTransactionHistory) {
-                    return unwrap(script.history ?? null);
+                receivedConfigs.push(config);
+
+                if (isLedgerSearch(config)) {
+                    return asRpcResponse(script.ledgerSearch ?? NOT_FOUND);
                 }
-                return unwrap(script.hot[Math.min(hotIndex++, script.hot.length - 1)] ?? null);
+                return asRpcResponse(nextHotPollResponse());
             },
+
             async getBlockHeight() {
-                return script.blockHeight ?? 0;
+                return script.blockHeight ?? HEIGHT_STILL_VALID;
             },
         };
 
-        return { connection, configs };
+        return { connection, receivedConfigs };
+    }
+
+    function expectUnknown(result: Awaited<ReturnType<typeof confirmBySignature>>) {
+        if (result.status !== 'unknown') {
+            assert.fail(`expected status "unknown" but got "${result.status}"`);
+        }
+        return result;
     }
 
     let clock: sinon.SinonFakeTimers | undefined;
+
     afterEach(() => {
-        clock?.restore();
-        clock = undefined;
+        if (clock !== undefined) {
+            clock.restore();
+            clock = undefined;
+        }
     });
 
     it('returns confirmed once the status reaches confirmed', async () => {
-        const { connection } = makeFake({ hot: [status({ confirmationStatus: 'confirmed' })] });
-        assert.deepStrictEqual(
-            await confirmBySignature(connection, SIG, LAST_VALID_BLOCK_HEIGHT),
-            { status: 'confirmed' });
+        const { connection } = makeFakeConnection({ hotPolls: [CONFIRMED] });
+
+        const result = await confirmBySignature(connection, SIGNATURE, LAST_VALID_BLOCK_HEIGHT);
+
+        assert.deepStrictEqual(result, { status: 'confirmed' });
     });
 
     it('returns failed when the transaction landed with an error', async () => {
-        const err = { InstructionError: [0, { Custom: 6001 }] };
-        const { connection } = makeFake({ hot: [status({ err, confirmationStatus: 'confirmed' })] });
-        assert.deepStrictEqual(
-            await confirmBySignature(connection, SIG, LAST_VALID_BLOCK_HEIGHT),
-            { status: 'failed', err });
+        const transactionError = { InstructionError: [0, { Custom: 6001 }] };
+        const failedStatus = makeStatus({ err: transactionError, confirmationStatus: 'confirmed' });
+        const { connection } = makeFakeConnection({ hotPolls: [failedStatus] });
+
+        const result = await confirmBySignature(connection, SIGNATURE, LAST_VALID_BLOCK_HEIGHT);
+
+        assert.deepStrictEqual(result, { status: 'failed', err: transactionError });
     });
 
     it('returns expired only once the ledger search also finds nothing', async () => {
-        const { connection } = makeFake({ hot: [null], history: null, blockHeight: EXPIRED_HEIGHT });
-        assert.deepStrictEqual(
-            await confirmBySignature(connection, SIG, LAST_VALID_BLOCK_HEIGHT, { ...FAST, heightCheckEvery: 1 }),
-            { status: 'expired' });
+        const { connection } = makeFakeConnection({
+            hotPolls: [NOT_FOUND],
+            ledgerSearch: NOT_FOUND,
+            blockHeight: HEIGHT_PAST_EXPIRY,
+        });
+
+        const result = await confirmBySignature(
+            connection, SIGNATURE, LAST_VALID_BLOCK_HEIGHT, CHECK_HEIGHT_EVERY_TICK);
+
+        assert.deepStrictEqual(result, { status: 'expired' });
     });
 
     it('returns confirmed when the signature fell out of the recent cache but is in the ledger', async () => {
-        const { connection } = makeFake({
-            hot: [null],
-            history: status({ confirmationStatus: 'finalized' }),
-            blockHeight: EXPIRED_HEIGHT,
+        const { connection } = makeFakeConnection({
+            hotPolls: [NOT_FOUND],
+            ledgerSearch: FINALIZED,
+            blockHeight: HEIGHT_PAST_EXPIRY,
         });
-        assert.deepStrictEqual(
-            await confirmBySignature(connection, SIG, LAST_VALID_BLOCK_HEIGHT, { ...FAST, heightCheckEvery: 1 }),
-            { status: 'confirmed' });
+
+        const result = await confirmBySignature(
+            connection, SIGNATURE, LAST_VALID_BLOCK_HEIGHT, CHECK_HEIGHT_EVERY_TICK);
+
+        assert.deepStrictEqual(result, { status: 'confirmed' });
     });
 
     it('keeps waiting when the ledger search finds the transaction still processed', async () => {
-        const { connection } = makeFake({
-            hot: [null, status({ confirmationStatus: 'confirmed' })],
-            history: status({ confirmationStatus: 'processed' }),
-            blockHeight: EXPIRED_HEIGHT,
+        const { connection } = makeFakeConnection({
+            hotPolls: [NOT_FOUND, CONFIRMED],
+            ledgerSearch: PROCESSED,
+            blockHeight: HEIGHT_PAST_EXPIRY,
         });
-        assert.deepStrictEqual(
-            await confirmBySignature(connection, SIG, LAST_VALID_BLOCK_HEIGHT, { ...FAST, heightCheckEvery: 1 }),
-            { status: 'confirmed' });
+
+        const result = await confirmBySignature(
+            connection, SIGNATURE, LAST_VALID_BLOCK_HEIGHT, CHECK_HEIGHT_EVERY_TICK);
+
+        assert.deepStrictEqual(result, { status: 'confirmed' });
     });
 
     it('throws straight away on a permanent RPC error instead of polling for the full timeout', async () => {
-        const { connection } = makeFake({ hot: [Object.assign(new Error('WrongSize'), { code: -32013 })] });
+        const malformedSignatureError = Object.assign(new Error('WrongSize'), { code: -32013 });
+        const { connection } = makeFakeConnection({ hotPolls: [malformedSignatureError] });
+
         await assert.rejects(
-            () => confirmBySignature(connection, SIG, LAST_VALID_BLOCK_HEIGHT, { ...FAST, timeoutMs: 30 }),
-            (err: unknown) => (err as { code?: number }).code === -32013);
+            () => confirmBySignature(
+                connection, SIGNATURE, LAST_VALID_BLOCK_HEIGHT, { ...FAST_POLLING, timeoutMs: 30 }),
+            (thrown: unknown) => thrown === malformedSignatureError,
+        );
     });
 
     it('retries a transient RPC error and still reports the real outcome', async () => {
-        const { connection } = makeFake({
-            hot: [new TypeError('fetch failed'), status({ confirmationStatus: 'confirmed' })],
+        const { connection } = makeFakeConnection({
+            hotPolls: [new TypeError('fetch failed'), CONFIRMED],
         });
-        assert.deepStrictEqual(
-            await confirmBySignature(connection, SIG, LAST_VALID_BLOCK_HEIGHT, FAST),
-            { status: 'confirmed' });
+
+        const result = await confirmBySignature(
+            connection, SIGNATURE, LAST_VALID_BLOCK_HEIGHT, FAST_POLLING);
+
+        assert.deepStrictEqual(result, { status: 'confirmed' });
     });
 
     it('never asks the ledger from the hot loop, and asks it exactly once past the block height', async () => {
-        const { connection, configs } = makeFake({ hot: [null], history: null, blockHeight: EXPIRED_HEIGHT });
+        const CHECK_HEIGHT_EVERY_THIRD_TICK = { ...FAST_POLLING, heightCheckEvery: 3 };
+        const { connection, receivedConfigs } = makeFakeConnection({
+            hotPolls: [NOT_FOUND],
+            ledgerSearch: NOT_FOUND,
+            blockHeight: HEIGHT_PAST_EXPIRY,
+        });
 
-        await confirmBySignature(connection, SIG, LAST_VALID_BLOCK_HEIGHT, { ...FAST, heightCheckEvery: 3 });
+        await confirmBySignature(
+            connection, SIGNATURE, LAST_VALID_BLOCK_HEIGHT, CHECK_HEIGHT_EVERY_THIRD_TICK);
 
-        const searched = configs.filter(c => c?.searchTransactionHistory === true);
-        assert.strictEqual(searched.length, 1, 'the ledger must be searched exactly once');
-        assert.strictEqual(configs.length, 4);
-        assert.deepStrictEqual(configs.slice(0, 3), [undefined, undefined, undefined]);
+        const cheapPolls = receivedConfigs.filter(config => config === undefined);
+        const ledgerSearches = receivedConfigs.filter(config => config?.searchTransactionHistory === true);
+        const lastConfig = receivedConfigs[receivedConfigs.length - 1];
+
+        assert.strictEqual(cheapPolls.length, 3, 'three cheap polls should run before the height check fires');
+        assert.strictEqual(ledgerSearches.length, 1, 'the expensive ledger search must run exactly once');
+        assert.strictEqual(receivedConfigs.length, 4, 'no other call should reach the RPC');
+        assert.strictEqual(lastConfig?.searchTransactionHistory, true, 'the ledger search must come last');
+    });
+
+    it('still detects expiry when heightCheckEvery is zero, instead of dividing by zero and never checking', async () => {
+        const NONSENSE_HEIGHT_CHECK = { ...FAST_POLLING, heightCheckEvery: 0, timeoutMs: 50 };
+        const { connection } = makeFakeConnection({
+            hotPolls: [NOT_FOUND],
+            ledgerSearch: NOT_FOUND,
+            blockHeight: HEIGHT_PAST_EXPIRY,
+        });
+
+        const result = await confirmBySignature(
+            connection, SIGNATURE, LAST_VALID_BLOCK_HEIGHT, NONSENSE_HEIGHT_CHECK);
+
+        assert.deepStrictEqual(result, { status: 'expired' });
     });
 
     it('reports unknown with the last error when the RPC never answers', async () => {
-        const { connection } = makeFake({ hot: [new TypeError('fetch failed')] });
+        const networkError = new TypeError('fetch failed');
+        const { connection } = makeFakeConnection({ hotPolls: [networkError] });
 
         const result = await confirmBySignature(
-            connection, SIG, LAST_VALID_BLOCK_HEIGHT, { ...FAST, timeoutMs: 20 });
+            connection, SIGNATURE, LAST_VALID_BLOCK_HEIGHT, GIVE_UP_QUICKLY);
 
-        assert.strictEqual(result.status, 'unknown');
-        assert.ok(result.status === 'unknown' && result.err instanceof TypeError);
+        const unknown = expectUnknown(result);
+        assert.strictEqual(unknown.err, networkError);
     });
 
     it('reports unknown without an error when the RPC answered but nothing ever landed', async () => {
-        const { connection } = makeFake({ hot: [null], blockHeight: 0 });
+        const { connection } = makeFakeConnection({
+            hotPolls: [NOT_FOUND],
+            blockHeight: HEIGHT_STILL_VALID,
+        });
 
         const result = await confirmBySignature(
-            connection, SIG, LAST_VALID_BLOCK_HEIGHT, { ...FAST, timeoutMs: 20 });
+            connection, SIGNATURE, LAST_VALID_BLOCK_HEIGHT, GIVE_UP_QUICKLY);
 
-        assert.strictEqual(result.status, 'unknown');
-        assert.strictEqual(result.status === 'unknown' ? result.err : 'missing', undefined);
+        const unknown = expectUnknown(result);
+        assert.strictEqual(unknown.err, undefined);
     });
 
     describe('with fake timers', () => {
         it('backs off 1s then 2s while the RPC rate limits, on top of the poll interval', async () => {
             clock = sinon.useFakeTimers();
-            const callTimes: number[] = [];
+
+            const virtualCallTimes: number[] = [];
+            const rateLimitError = new Error('429 Too Many Requests: {}');
             let attempt = 0;
 
             const connection: SignatureConfirmer = {
                 async getSignatureStatuses() {
-                    callTimes.push(Date.now());
-                    if (attempt++ < 2) throw new Error('429 Too Many Requests: {}');
-                    return { context: { slot: 1 }, value: [status({ confirmationStatus: 'confirmed' })] };
+                    virtualCallTimes.push(Date.now());
+
+                    const isOneOfTheFirstTwoAttempts = attempt < 2;
+                    attempt = attempt + 1;
+                    if (isOneOfTheFirstTwoAttempts) {
+                        throw rateLimitError;
+                    }
+                    return { context: { slot: 1 }, value: [CONFIRMED] };
                 },
-                async getBlockHeight() { return 0; },
+                async getBlockHeight() {
+                    return HEIGHT_STILL_VALID;
+                },
             };
 
-            const pending = confirmBySignature(connection, SIG, LAST_VALID_BLOCK_HEIGHT);
+            const pending = confirmBySignature(connection, SIGNATURE, LAST_VALID_BLOCK_HEIGHT);
             await clock.tickAsync(10_000);
+            const result = await pending;
 
-            assert.deepStrictEqual(await pending, { status: 'confirmed' });
-            assert.deepStrictEqual(callTimes, [0, 1400, 3800]);
+            const firstCall = 0;
+            const secondCall = firstCall + 400 + 1000;
+            const thirdCall = secondCall + 400 + 2000;
+
+            assert.deepStrictEqual(result, { status: 'confirmed' });
+            assert.deepStrictEqual(virtualCallTimes, [firstCall, secondCall, thirdCall]);
         });
 
         it('gives up at the default 120s timeout without waiting for real time', async () => {
             clock = sinon.useFakeTimers();
+
             const connection: SignatureConfirmer = {
-                async getSignatureStatuses() { throw new TypeError('fetch failed'); },
-                async getBlockHeight() { return 0; },
+                async getSignatureStatuses() {
+                    throw new TypeError('fetch failed');
+                },
+                async getBlockHeight() {
+                    return HEIGHT_STILL_VALID;
+                },
             };
 
-            const pending = confirmBySignature(connection, SIG, LAST_VALID_BLOCK_HEIGHT);
+            const pending = confirmBySignature(connection, SIGNATURE, LAST_VALID_BLOCK_HEIGHT);
             await clock.tickAsync(130_000);
+            const result = await pending;
 
-            assert.strictEqual((await pending).status, 'unknown');
+            expectUnknown(result);
         });
     });
 });
